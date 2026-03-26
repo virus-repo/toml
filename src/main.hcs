@@ -1,1 +1,642 @@
+// toml.hcs – parser TOML dla HackerScript
+// Obsługuje podstawową składnię TOML v1.0.0 (klucz = wartość, tabele, tablice, typy)
+// Użycie: from [toml] require [load_file, load_string, as_table, as_array, as_str, as_int, as_float, as_bool]
 
+from [std] require [io, string, math]
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Typy TOML
+// ──────────────────────────────────────────────────────────────────────────────
+
+enum TomlType
+    Table
+    Array
+    String
+    Integer
+    Float
+    Boolean
+    Datetime   // uproszczony: przechowujemy jako string
+end
+
+/// Uniwersalna wartość TOML
+obj TomlValue
+    type: TomlType
+
+    // dla tabeli: lista par (klucz, wartość)
+    table: [(str, TomlValue)]
+
+    // dla tablicy
+    array: [TomlValue]
+
+    // dla skalarnych typów
+    str_val: str
+    int_val: i64
+    float_val: f64
+    bool_val: bool
+    datetime_val: str
+end
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Funkcje pomocnicze (skaner i parser)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Struktura stanu parsera
+obj ParserState
+    input: str
+    pos: i64
+    line: i64
+    col: i64
+    len: i64
+end
+
+fn is_whitespace(c: i32) : bool
+    return c == 32 or c == 9 or c == 10 or c == 13
+end
+
+fn is_digit(c: i32) : bool
+    return c >= 48 and c <= 57
+end
+
+fn is_alpha(c: i32) : bool
+    return (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c == 95  // _
+end
+
+fn peek(state: ParserState) : i32
+    if state.pos < state.len
+        return state.input.ptr[state.pos] as i32
+    end
+    return 0
+end
+
+fn advance(state: ParserState)
+    if state.pos < state.len
+        let c = state.input.ptr[state.pos] as i32
+        if c == 10
+            state.line += 1
+            state.col = 1
+        else
+            state.col += 1
+        end
+        state.pos += 1
+    end
+end
+
+fn skip_whitespace(state: ParserState)
+    while is_whitespace(peek(state))
+        advance(state)
+    end
+end
+
+fn skip_comment(state: ParserState)
+    if peek(state) == 35  // '#'
+        while state.pos < state.len and peek(state) != 10
+            advance(state)
+        end
+        // skip newline also?
+        if peek(state) == 10
+            advance(state)
+        end
+    end
+end
+
+fn expect_char(state: ParserState, expected: i32) : bool
+    skip_whitespace(state)
+    skip_comment(state)
+    if peek(state) == expected
+        advance(state)
+        return true
+    end
+    return false
+end
+
+/// Parsuje identyfikator (klucz)
+fn parse_key(state: ParserState) : Option<str>
+    skip_whitespace(state)
+    if not is_alpha(peek(state)) and peek(state) != 34  // '"'
+        return nil
+    end
+
+    let mut start = state.pos
+    let mut quoted = false
+
+    if peek(state) == 34  // '"'
+        quoted = true
+        advance(state)  // skip opening quote
+        start = state.pos
+        while state.pos < state.len and peek(state) != 34
+            if peek(state) == 92  // '\' escape
+                advance(state)   // skip backslash
+                // obsługa escape sequence (uproszczona)
+                if peek(state) != 0
+                    advance(state)
+                end
+            else
+                advance(state)
+            end
+        end
+        if peek(state) != 34
+            return nil  // unmatched quote
+        end
+        let key = state.input.ptr[start..state.pos] as str
+        advance(state)  // skip closing quote
+        return key
+    else
+        while state.pos < state.len and (is_alpha(peek(state)) or is_digit(peek(state)) or peek(state) == 45 or peek(state) == 95)
+            advance(state)
+        end
+        return state.input.ptr[start..state.pos] as str
+    end
+end
+
+/// Parsuje wartość TOML
+fn parse_value(state: ParserState) : Option<TomlValue>
+    skip_whitespace(state)
+    skip_comment(state)
+
+    let c = peek(state)
+
+    // String (cudzysłów)
+    if c == 34  // '"'
+        advance(state)  // skip opening quote
+        let mut start = state.pos
+        while state.pos < state.len and peek(state) != 34
+            if peek(state) == 92  // '\'
+                advance(state)   // skip backslash
+                if peek(state) != 0
+                    advance(state)
+                end
+            else
+                advance(state)
+            end
+        end
+        if peek(state) != 34
+            return nil
+        end
+        let val = state.input.ptr[start..state.pos] as str
+        advance(state)  // skip closing quote
+
+        let mut result = HCS_ALLOC_ZERO(_scope_arena, TomlValue)
+        result.type = TomlType.String
+        result.str_val = val
+        return result
+    end
+
+    // Liczba całkowita lub zmiennoprzecinkowa
+    if c == 45 or is_digit(c)  // '-' or digit
+        let mut start = state.pos
+        let mut has_dot = false
+        while state.pos < state.len and (is_digit(peek(state)) or peek(state) == 46 or peek(state) == 45)
+            if peek(state) == 46
+                has_dot = true
+            end
+            advance(state)
+        end
+        let num_str = state.input.ptr[start..state.pos] as str
+
+        let mut result = HCS_ALLOC_ZERO(_scope_arena, TomlValue)
+        if has_dot
+            result.type = TomlType.Float
+            result.float_val = str_to_f64(num_str)
+        else
+            result.type = TomlType.Integer
+            result.int_val = str_to_i64(num_str)
+        end
+        return result
+    end
+
+    // Boolean
+    if c == 116  // 't'
+        if state.pos + 3 < state.len and state.input.ptr[state.pos..state.pos+4] as str == "true"
+            advance(state); advance(state); advance(state); advance(state)
+            let mut result = HCS_ALLOC_ZERO(_scope_arena, TomlValue)
+            result.type = TomlType.Boolean
+            result.bool_val = true
+            return result
+        end
+    end
+    if c == 102  // 'f'
+        if state.pos + 4 < state.len and state.input.ptr[state.pos..state.pos+5] as str == "false"
+            advance(state); advance(state); advance(state); advance(state); advance(state)
+            let mut result = HCS_ALLOC_ZERO(_scope_arena, TomlValue)
+            result.type = TomlType.Boolean
+            result.bool_val = false
+            return result
+        end
+    end
+
+    // Tablica: [ ... ]
+    if c == 91  // '['
+        advance(state)  // skip opening [
+        let mut items = [] as [TomlValue]
+        skip_whitespace(state)
+        if peek(state) == 93  // ']'
+            advance(state)
+            let mut result = HCS_ALLOC_ZERO(_scope_arena, TomlValue)
+            result.type = TomlType.Array
+            result.array = items
+            return result
+        end
+        loop
+            let item = parse_value(state)
+            if item == nil
+                return nil
+            end
+            items.push(item)
+            skip_whitespace(state)
+            if peek(state) == 44  // ','
+                advance(state)
+                continue
+            end
+            break
+        end
+        if not expect_char(state, 93)  // ']'
+            return nil
+        end
+        let mut result = HCS_ALLOC_ZERO(_scope_arena, TomlValue)
+        result.type = TomlType.Array
+        result.array = items
+        return result
+    end
+
+    // Data/Czas (uproszczony, traktowany jako string)
+    if (c >= 48 and c <= 57) or c == 45  // digit or '-' for date
+        let mut start = state.pos
+        while state.pos < state.len and (is_digit(peek(state)) or peek(state) == 45 or peek(state) == 58 or peek(state) == 46 or peek(state) == 84 or peek(state) == 90 or peek(state) == 43 or peek(state) == 45)
+            advance(state)
+        end
+        let dt_str = state.input.ptr[start..state.pos] as str
+        let mut result = HCS_ALLOC_ZERO(_scope_arena, TomlValue)
+        result.type = TomlType.Datetime
+        result.datetime_val = dt_str
+        return result
+    end
+
+    return nil
+end
+
+/// Parsuje linię: klucz = wartość
+fn parse_kv(state: ParserState, table: TomlValue) : bool
+    let key = parse_key(state)
+    if key == nil
+        return false
+    end
+    skip_whitespace(state)
+    if not expect_char(state, 61)  // '='
+        return false
+    end
+    let value = parse_value(state)
+    if value == nil
+        return false
+    end
+    // Dodaj do tabeli
+    table.table.push((key, value))
+    // Po wartości może być komentarz lub nowa linia
+    skip_whitespace(state)
+    skip_comment(state)
+    if peek(state) == 10  // newline
+        advance(state)
+    end
+    return true
+end
+
+/// Parsuje sekcję tabeli: [section] lub [[section]]
+fn parse_section(state: ParserState, root: TomlValue) : bool
+    let mut is_array = false
+    if peek(state) == 91  // '['
+        advance(state)
+        if peek(state) == 91  // second '['
+            is_array = true
+            advance(state)
+        end
+    else
+        return false
+    end
+
+    // Parsujemy pełną ścieżkę: a.b.c
+    let mut path = [] as [str]
+    loop
+        let part = parse_key(state)
+        if part == nil
+            return false
+        end
+        path.push(part)
+        skip_whitespace(state)
+        if peek(state) == 46  // '.'
+            advance(state)
+            continue
+        end
+        break
+    end
+
+    if is_array
+        // [[section]] oznacza tablicę tabel
+        if not expect_char(state, 93) or not expect_char(state, 93)  // ']]'
+            return false
+        end
+    else
+        if not expect_char(state, 93)  // ']'
+            return false
+        end
+    end
+
+    // Nawigacja do miejsca w drzewie, tworząc brakujące tabele
+    let mut current = root
+    for i in 0..path.len-1
+        let key = path[i]
+        let mut found = nil as TomlValue
+        for (k, v) in current.table
+            if k == key and v.type == TomlType.Table
+                found = v
+                break
+            end
+        end
+        if found == nil
+            // utwórz nową tabelę
+            let new_table = HCS_ALLOC_ZERO(_scope_arena, TomlValue)
+            new_table.type = TomlType.Table
+            new_table.table = [] as [(str, TomlValue)]
+            current.table.push((key, new_table))
+            current = new_table
+        else
+            current = found
+        end
+    end
+
+    let final_key = path[path.len-1]
+    if is_array
+        // tablica tabel – tworzymy nowy element i dodajemy do istniejącej tablicy
+        let mut array_table = nil as TomlValue
+        // szukamy istniejącej tablicy w current pod kluczem final_key
+        for (k, v) in current.table
+            if k == final_key and v.type == TomlType.Array
+                array_table = v
+                break
+            end
+        end
+        if array_table == nil
+            array_table = HCS_ALLOC_ZERO(_scope_arena, TomlValue)
+            array_table.type = TomlType.Array
+            array_table.array = [] as [TomlValue]
+            current.table.push((final_key, array_table))
+        end
+        let new_table = HCS_ALLOC_ZERO(_scope_arena, TomlValue)
+        new_table.type = TomlType.Table
+        new_table.table = [] as [(str, TomlValue)]
+        array_table.array.push(new_table)
+        current = new_table
+    else
+        // zwykła tabela – zastępujemy, jeśli istnieje
+        let mut found = nil as TomlValue
+        for (k, v) in current.table
+            if k == final_key
+                found = v
+                break
+            end
+        end
+        if found != nil and found.type != TomlType.Table
+            // konflikt typów
+            return false
+        end
+        if found == nil
+            found = HCS_ALLOC_ZERO(_scope_arena, TomlValue)
+            found.type = TomlType.Table
+            found.table = [] as [(str, TomlValue)]
+            current.table.push((final_key, found))
+        end
+        current = found
+    end
+
+    // Po sekcji mogą być pary klucz=wartość w kolejnych liniach
+    while state.pos < state.len
+        skip_whitespace(state)
+        skip_comment(state)
+        if peek(state) == 10
+            advance(state)
+            continue
+        end
+        if peek(state) == 91  // start nowej sekcji
+            break
+        end
+        if not parse_kv(state, current)
+            break
+        end
+    end
+    return true
+end
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Główna funkcja parsująca
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Parsuje cały dokument TOML i zwraca tabelę główną.
+fn parse_toml(input: str) : Option<TomlValue>
+    direct
+        let mut state = HCS_ALLOC_ZERO(_scope_arena, ParserState)
+        state.input = input
+        state.pos = 0
+        state.line = 1
+        state.col = 1
+        state.len = input.len
+
+        // Korzeń – tabela główna
+        let root = HCS_ALLOC_ZERO(_scope_arena, TomlValue)
+        root.type = TomlType.Table
+        root.table = [] as [(str, TomlValue)]
+
+        while state.pos < state.len
+            skip_whitespace(state)
+            skip_comment(state)
+            if state.pos >= state.len
+                break
+            end
+
+            if peek(state) == 91  // początek sekcji
+                if not parse_section(state, root)
+                    return nil
+                end
+            else
+                // klucz=wartość w głównej tabeli
+                if not parse_kv(state, root)
+                    // błąd składni
+                    return nil
+                end
+            end
+        end
+        return root
+    end
+end
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Publiczne API
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Ładuje plik TOML i zwraca Option<TomlValue> (tabelę główną).
+fn load_file(path: str) : Option<TomlValue>
+    direct
+        let file = fopen(path.ptr, "rb")
+        if file == nil
+            return nil
+        end
+
+        // Odczyt całego pliku do bufora
+        fseek(file, 0, 2)  // SEEK_END
+        let size = ftell(file) as u64
+        fseek(file, 0, 0)  // SEEK_SET
+
+        let buf = HCS_ALLOC_N(_scope_arena, u8, size + 1)
+        if fread(buf, 1, size, file) != size
+            fclose(file)
+            return nil
+        end
+        buf[size] = 0
+
+        fclose(file)
+
+        let input = buf as str
+        return parse_toml(input)
+    end
+end
+
+/// Parsuje napis TOML i zwraca Option<TomlValue>.
+fn load_string(input: str) : Option<TomlValue>
+    return parse_toml(input)
+end
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Funkcje dostępu
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Zwraca wartość jako tabelę (mapę) lub nil.
+fn as_table(val: TomlValue) : Option<[(str, TomlValue)]>
+    if val.type != TomlType.Table
+        return nil
+    end
+    return val.table
+end
+
+/// Zwraca wartość jako tablicę lub nil.
+fn as_array(val: TomlValue) : Option<[TomlValue]>
+    if val.type != TomlType.Array
+        return nil
+    end
+    return val.array
+end
+
+/// Zwraca wartość jako napis (dla string, datetime) lub nil.
+fn as_str(val: TomlValue) : Option<str>
+    if val.type == TomlType.String
+        return val.str_val
+    end
+    if val.type == TomlType.Datetime
+        return val.datetime_val
+    end
+    return nil
+end
+
+/// Zwraca wartość jako liczbę całkowitą (int) lub nil.
+fn as_int(val: TomlValue) : Option<i64>
+    if val.type == TomlType.Integer
+        return val.int_val
+    end
+    // próba konwersji z stringa (np. "42")
+    if val.type == TomlType.String
+        let s = val.str_val
+        let mut res = 0i64
+        let mut i = 0
+        let mut sign = 1
+        while i < s.len
+            let c = s.ptr[i] as i32
+            if c == 45
+                sign = -1
+            else if c >= 48 and c <= 57
+                res = res * 10 + (c - 48) as i64
+            else
+                return nil
+            end
+            i += 1
+        end
+        return res * sign
+    end
+    return nil
+end
+
+/// Zwraca wartość jako liczbę zmiennoprzecinkową (float) lub nil.
+fn as_float(val: TomlValue) : Option<f64>
+    if val.type == TomlType.Float
+        return val.float_val
+    end
+    // próba konwersji z integera
+    if val.type == TomlType.Integer
+        return val.int_val as f64
+    end
+    return nil
+end
+
+/// Zwraca wartość jako bool lub nil.
+fn as_bool(val: TomlValue) : Option<bool>
+    if val.type == TomlType.Boolean
+        return val.bool_val
+    end
+    return nil
+end
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Funkcja pomocnicza do nawigacji po tabelach
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Pobiera wartość z tabeli (lub zagnieżdżoną) po ścieżce z kropkami.
+/// Zwraca Option<TomlValue>.
+fn get_path(root: TomlValue, path: str) : Option<TomlValue>
+    if root.type != TomlType.Table
+        return nil
+    end
+    let parts = split(path, ".")
+    let mut current = root
+    for part in parts
+        let mut found = nil as TomlValue
+        for (k, v) in current.table
+            if k == part
+                found = v
+                break
+            end
+        end
+        if found == nil
+            return nil
+        end
+        current = found
+    end
+    return current
+end
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Przykład użycia (komentarz)
+// ──────────────────────────────────────────────────────────────────────────────
+/*
+from [toml] require [load_file, as_table, as_str, as_int, get_path]
+
+fn main() : i32
+    let config = load_file("config.toml")
+    if config == nil
+        write [Failed to load TOML]
+        return 1
+    end
+
+    let title = get_path(config, "title")
+    if title != nil
+        let s = as_str(title)
+        if s != nil
+            write [Title: {s}]
+        end
+    end
+
+    let port = get_path(config, "server.port")
+    if port != nil
+        let p = as_int(port)
+        if p != nil
+            write [Port: {p}]
+        end
+    end
+
+    return 0
+end
+*/
