@@ -1,1 +1,23 @@
+[project]
+name = "toml"
+version = "0.0.1"
+description = "Toml parser for HackerScript"
+authors = ["Virus Developers"]
+edition = "2025"
+entry = "src/main.hcs"
+output = "bin"
+license = "BSD-3"
+repository = "https://github.com/virus-repo/json/"
+keywords = ["virus-io", "virus-repository", "hackerscript"]
 
+[build]
+link = "static"
+c_standard = 99
+opt_level = "2"
+lto = true
+strip = false
+
+[dependencies]
+
+[cmake]
+min_version = "3.20"
